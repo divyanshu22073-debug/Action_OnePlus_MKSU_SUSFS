@@ -212,6 +212,26 @@ jobs:
 
           cd ./common
           patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch || true
+
+          # --- STEP 1: SUSFS compile-layer fixes (MUST run AFTER the susfs patch) ---
+          # --- 1a. SUSFS include fix for mm/memory.c ----------------------------------
+          # The susfs patch hunk #1 inserts '#include <linux/susfs_def.h>' right after
+          # '#include <linux/vmalloc.h>'. On the oplus tree the surrounding include
+          # context drifts, so hunk #1 is rejected and the file later fails -Werror
+          # with implicit declarations (SUSFS_IS_INODE_SUS_MAP). Re-do the insertion
+          # deterministically after the patch has run:
+          if ! grep -q "linux/susfs_def.h" mm/memory.c; then
+            sed -i '/#include <linux\/vmalloc.h>/a #include <linux/susfs_def.h>' mm/memory.c
+          fi
+
+          # --- 1b. -Werror=maybe-uninitialized fix for fs/proc/task_mmu.c -------------
+          # The susfs show_map_vma() changes add 'struct dentry *dentry;', which clang
+          # -Werror flags as (sometimes-)uninitialized. Initialize it to NULL (idempotent):
+          sed -i 's/struct dentry \*dentry;/struct dentry *dentry = NULL;/g' fs/proc/task_mmu.c || true
+
+          echo "=== SUSFS fix-up verification ==="
+          grep -n "linux/susfs_def.h" mm/memory.c || echo "WARNING: susfs_def.h include still missing in mm/memory.c"
+          grep -n "struct dentry \*dentry = NULL;" fs/proc/task_mmu.c || echo "NOTE: no dentry declaration to initialize in task_mmu.c"
           echo "完成"
 
       - name: Apply Hide Stuff Patches
@@ -240,11 +260,18 @@ jobs:
 
           # SukiSU Ultra config
           echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
+
+          # --- STEP 3: Kconfig symbol management (KPM + stale-symbol cleanup) ---
+          # --- 3a. KPM (SukiSU Kernel Patch Module) ------------------------------------
+          # Official SukiSU-Ultra requirement: CONFIG_KPM=y (KALLSYMS is already on in
+          # GKI). The symbol only exists AFTER the SukiSU/KPM kernel patches have been
+          # applied, so this must run after patching and before the build:
+          if [ "${{ github.event.inputs.KPM }}" = "true" ]; then
+            grep -q "^CONFIG_KPM=" "$CONFIG_FILE" || echo "CONFIG_KPM=y" >> "$CONFIG_FILE"
+          fi
 
           # SUSFS config
           echo "CONFIG_KSU_SUSFS=y" >> "$CONFIG_FILE"
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$CONFIG_FILE"
@@ -258,6 +285,11 @@ jobs:
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$CONFIG_FILE"
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$CONFIG_FILE"
+
+          # --- 3b. Remove stale SUSFS magic-mount symbol -------------------------------
+          # SUSFS v1.5.2+ no longer defines CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT; leaving it
+          # in the defconfig only produces kconfig warnings on every build:
+          sed -i '/CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT/d' "$CONFIG_FILE"
 
           # Remove check_defconfig
           sed -i 's/check_defconfig//' ./common/build.config.gki
@@ -314,70 +346,160 @@ jobs:
             fi
           fi
 
+          # =====================================================================
+          # STEP 4: Performance configuration injection (verified 5.15 symbols ONLY)
+          # Every symbol below exists in the Linux 5.15 Kconfig sources and in the
+          # OnePlusOSS sm7550 tree. All echoes are guarded so re-runs are idempotent.
+          # =====================================================================
+          CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
+
+          # --- 4a. Network: BBR + FQ ----------------------------------------------------
+          # TCP_CONG_BBR lives inside 'if TCP_CONG_ADVANCED' in 5.15 — the gate is
+          # MANDATORY or kconfig silently drops BBR:
+          grep -q "^CONFIG_TCP_CONG_ADVANCED=" "$CONFIG_FILE" || echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CONFIG_FILE"
+          grep -q "^CONFIG_TCP_CONG_BBR="       "$CONFIG_FILE" || echo "CONFIG_TCP_CONG_BBR=y"       >> "$CONFIG_FILE"
+          grep -q "^CONFIG_DEFAULT_BBR="        "$CONFIG_FILE" || echo "CONFIG_DEFAULT_BBR=y"        >> "$CONFIG_FILE"
+          grep -q "^CONFIG_DEFAULT_TCP_CONG="   "$CONFIG_FILE" || echo 'CONFIG_DEFAULT_TCP_CONG="bbr"' >> "$CONFIG_FILE"
+          # FQ pacing qdisc (already =y in this tree's gki_defconfig; kept as ensure):
+          grep -q "^CONFIG_NET_SCH_FQ="         "$CONFIG_FILE" || echo "CONFIG_NET_SCH_FQ=y"         >> "$CONFIG_FILE"
+          # Make FQ the system default qdisc (valid 5.15 symbols:
+          # NET_SCH_DEFAULT + DEFAULT_FQ -> DEFAULT_NET_SCH="fq"):
+          grep -q "^CONFIG_NET_SCH_DEFAULT="    "$CONFIG_FILE" || echo "CONFIG_NET_SCH_DEFAULT=y"    >> "$CONFIG_FILE"
+          grep -q "^CONFIG_DEFAULT_FQ="         "$CONFIG_FILE" || echo "CONFIG_DEFAULT_FQ=y"         >> "$CONFIG_FILE"
+          # NOTE: there is NO ECN Kconfig symbol in 5.15 (CONFIG_IP_ECN is invalid).
+          # ECN is unconditionally compiled and runtime-controlled via sysctl
+          # net.ipv4.tcp_ecn. Do NOT echo any ECN config line.
+
+          # --- 4b. GPU devfreq (mainline governors only) --------------------------------
+          # The Adreno-720 KGSL driver and the MSM_ADRENO_TZ governor are built from the
+          # vendor modules side with stock fragments; CONFIG_MSM_KGSL /
+          # CONFIG_DEVFREQ_GOV_MSM_ADRENO_TZ do not exist in the GKI kernel tree.
+          # Ensure the mainline governors instead — SIMPLE_ONDEMAND is the one KGSL
+          # falls back to and is missing from the tree's gki_defconfig:
+          grep -q "^CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND=" "$CONFIG_FILE" || echo "CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND=y" >> "$CONFIG_FILE"
+          grep -q "^CONFIG_DEVFREQ_GOV_PERFORMANCE="     "$CONFIG_FILE" || echo "CONFIG_DEVFREQ_GOV_PERFORMANCE=y"     >> "$CONFIG_FILE"
+          grep -q "^CONFIG_DEVFREQ_GOV_USERSPACE="       "$CONFIG_FILE" || echo "CONFIG_DEVFREQ_GOV_USERSPACE=y"       >> "$CONFIG_FILE"
+
+          # --- 4c. ZRAM: default compressor (5.15-correct method) -----------------------
+          # The 5.15 zram driver reads CONFIG_ZRAM_DEF_COMP from a real Kconfig choice.
+          # Set LZ4 unless the LZ4KD workflow path already selected a choice member
+          # (ZRAM_DEF_COMP is a choice — two members would just conflict):
+          grep -q "^CONFIG_ZRAM="              "$CONFIG_FILE" || echo "CONFIG_ZRAM=y"              >> "$CONFIG_FILE"
+          grep -q "^CONFIG_CRYPTO_LZ4="        "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZ4=y"        >> "$CONFIG_FILE"
+          grep -q "^CONFIG_CRYPTO_LZ4HC="      "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZ4HC=y"      >> "$CONFIG_FILE"
+          if ! grep -q "^CONFIG_ZRAM_DEF_COMP_LZ4KD=y" "$CONFIG_FILE"; then
+            grep -q "^CONFIG_ZRAM_DEF_COMP_LZ4=" "$CONFIG_FILE" || echo "CONFIG_ZRAM_DEF_COMP_LZ4=y" >> "$CONFIG_FILE"
+          fi
+          grep -q "^CONFIG_ZRAM_WRITEBACK="    "$CONFIG_FILE" || echo "CONFIG_ZRAM_WRITEBACK=y"    >> "$CONFIG_FILE"
+
+          # --- 4d. Scheduler: utilization clamping --------------------------------------
+          # Already =y in this tree's gki_defconfig; kept as idempotent ensures:
+          grep -q "^CONFIG_UCLAMP_TASK="       "$CONFIG_FILE" || echo "CONFIG_UCLAMP_TASK=y"       >> "$CONFIG_FILE"
+          grep -q "^CONFIG_UCLAMP_TASK_GROUP=" "$CONFIG_FILE" || echo "CONFIG_UCLAMP_TASK_GROUP=y" >> "$CONFIG_FILE"
+
+          # --- 4e. I/O scheduler ---------------------------------------------------------
+          # Valid 5.15 symbol (mainline default y); coexists with the tree's BFQ:
+          grep -q "^CONFIG_MQ_IOSCHED_KYBER="  "$CONFIG_FILE" || echo "CONFIG_MQ_IOSCHED_KYBER=y" >> "$CONFIG_FILE"
+
+          # --- 4f. Compiler / allocator ---------------------------------------------------
+          # This tree's gki_defconfig pins CONFIG_LTO_CLANG_FULL=y. LTO level is a
+          # Kconfig choice, so DELETE FULL before appending THIN (large CI speedup):
+          sed -i '/^CONFIG_LTO_CLANG_FULL=y/d' "$CONFIG_FILE"
+          grep -q "^CONFIG_LTO_CLANG_THIN="    "$CONFIG_FILE" || echo "CONFIG_LTO_CLANG_THIN=y"   >> "$CONFIG_FILE"
+          # SLUB debug support off (valid 5.15 symbol; the runtime slub_debug= param
+          # then becomes a no-op, which is the intent):
+          grep -q "^CONFIG_SLUB_DEBUG="        "$CONFIG_FILE" || echo "CONFIG_SLUB_DEBUG=n"       >> "$CONFIG_FILE"
+          # DEBUG_INFO: the tree base sets DEBUG_INFO=y + DWARF4 + DEBUG_INFO_BTF=y and
+          # the oplus fragment already adds DEBUG_INFO_REDUCED=y. Turning DEBUG_INFO off
+          # also kills BTF, which breaks the Android bpfloader / tethering offload on
+          # Android 13+ ROMs. RECOMMENDED: leave debug info untouched (the flashable
+          # Image contains no DWARF anyway — only vmlinux and .ko files do).
+          # Only if you explicitly accept the bpfloader risk, uncomment the next line:
+          # sed -i '/^CONFIG_DEBUG_INFO=y/d;/^CONFIG_DEBUG_INFO_DWARF4=y/d;/^CONFIG_DEBUG_INFO_BTF=y/d' "$CONFIG_FILE" && echo "# CONFIG_DEBUG_INFO is not set" >> "$CONFIG_FILE"
+          # NTSYNC: does NOT exist in 5.15 (merged upstream in 6.7 under drivers/misc).
+          # Only meaningful for Wine/Winlator users and only after an explicit backport
+          # of the ntsync driver into this tree. Guarded no-op otherwise:
+          if [ -d ./common/drivers/misc/ntsync ] || [ -d ./common/fs/ntsync ]; then
+            grep -q "^CONFIG_NTSYNC=" "$CONFIG_FILE" || echo "CONFIG_NTSYNC=y" >> "$CONFIG_FILE"
+          fi
+
+          echo "=== Injected defconfig tail (audit) ==="
+          grep -nE "CONFIG_KPM|CONFIG_TCP_CONG|CONFIG_DEFAULT_BBR|CONFIG_DEFAULT_TCP_CONG|CONFIG_NET_SCH_FQ|CONFIG_NET_SCH_DEFAULT|CONFIG_DEFAULT_FQ|CONFIG_DEVFREQ_GOV|CONFIG_ZRAM|CONFIG_CRYPTO_LZ4|CONFIG_UCLAMP|CONFIG_MQ_IOSCHED_KYBER|CONFIG_LTO_CLANG|CONFIG_SLUB_DEBUG|CONFIG_NTSYNC" "$CONFIG_FILE" || true
+
       - name: Build kernel
         if: ${{ github.event.inputs.CPU == 'sm8650' || github.event.inputs.CPU == 'sm7675' }}
         run: |
+          # STEP 2: GitHub Actions' default `bash -e {0}` does NOT enable pipefail.
+          # Without it `... 2>&1 | tee build.log` returns tee's exit code (0) and
+          # the job reports success on a dead build. Make the pipeline fail through.
+          set -o pipefail
           cd kernel_workspace
-          ./kernel_platform/build_with_bazel.py -t ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
-          
+          ./kernel_platform/build_with_bazel.py -t ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }} 2>&1 | tee build.log
+
       - name: Fallback build kernel
         if: ${{ github.event.inputs.CPU != 'sm8650' && github.event.inputs.CPU != 'sm7675' }}
         run: |
-         cd kernel_workspace
-         LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }}
+          # STEP 2: GitHub Actions' default `bash -e {0}` does NOT enable pipefail.
+          # Without it `... 2>&1 | tee build.log` returns tee's exit code (0) and
+          # the job reports success on a dead build. Make the pipeline fail through.
+          set -o pipefail
+          cd kernel_workspace
+          LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ github.event.inputs.CPUD }} ${{ github.event.inputs.BUILD_METHOD }} 2>&1 | tee build.log
+
+          # oplus_build_kernel.sh's interactive menu swallows non-zero exit codes in
+          # some paths (the failed run above logged 'make ... Error 2' and still
+          # printed the 'build total time' banner). Fail explicitly on compiler errors
+          # so a dead build never reaches packaging:
+          if grep -qE "^(source/)?[A-Za-z0-9_./-]+\.[ch]:[0-9]+:[0-9]+: error:|\*\*\* \[.*\] Error [0-9]+" build.log; then
+            echo "::error::Kernel compilation errors detected in build.log — failing the job."
+            grep -nE "error:|\*\*\* \[.*\] Error [0-9]+" build.log | head -n 40
+            exit 1
+          fi
 
       - name: Make AnyKernel3
         run: |
           git clone https://github.com/Numbersf/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
 
-          dir1="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir2="kernel_workspace/kernel_platform/bazel-out/k8-fastbuild/bin/msm-kernel/${{ github.event.inputs.CPUD }}_gki_kbuild_mixed_tree/"
-          dir3="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir4="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
-          dir5="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
-          target1="./AnyKernel3/"
-          target2="./kernel_workspace/kernel"
-
-          # 查找 Image 文件
-          if find "$dir1" -name "Image" | grep -q "Image"; then
-            image_path="$dir1"Image
-          elif find "$dir2" -name "Image" | grep -q "Image"; then
-            image_path="$dir2"Image
-          elif find "$dir3" -name "Image" | grep -q "Image"; then
-            image_path="$dir3"Image
-          elif find "$dir4" -name "Image" | grep -q "Image"; then
-            image_path="$dir4"Image
-          elif find "$dir5" -name "Image" | grep -q "Image"; then
-            image_path="$dir5"Image
-          else
-            image_path=$(find "./kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
+          # STEP 5: dynamic Image discovery. Never hardcode an out-dir path: the
+          # oplus build script silently remaps unknown CPUD values (e.g. crow ->
+          # "auto select platform kalama"), so out/msm-kernel-<CPUD>-<method> may
+          # not exist even after a successful build.
+          IMAGE_SRC=""
+          # Tier 1: bazel/kleaf dist directories (the normal oplus kernel_platform layout)
+          IMAGE_SRC=$(find kernel_workspace/kernel_platform/out -type f -name Image -path "*dist*" 2>/dev/null | head -n 1)
+          # Tier 2: anywhere under the kernel_platform out/ tree
+          if [ -z "$IMAGE_SRC" ]; then
+            IMAGE_SRC=$(find kernel_workspace/kernel_platform/out -type f -name Image 2>/dev/null | head -n 1)
+          fi
+          # Tier 3: classic OBJ layout anywhere in the workspace
+          if [ -z "$IMAGE_SRC" ]; then
+            IMAGE_SRC=$(find kernel_workspace -type f -name Image -path "*arm64/boot*" 2>/dev/null | head -n 1)
           fi
 
-          # 拷贝 Image
-          if [ -n "$image_path" ] && [ -f "$image_path" ]; then
-            mkdir -p "$dir1"
-            if [ "$(realpath "$image_path")" != "$(realpath "$dir1"Image)" ]; then
-              cp "$image_path" "$dir1"
-            else
-              echo "源文件与目标相同，跳过复制"
-            fi
-            cp "$dir1"Image ./AnyKernel3/Image
+          if [ -n "$IMAGE_SRC" ] && [ -s "$IMAGE_SRC" ]; then
+            cp "$IMAGE_SRC" ./AnyKernel3/Image
+            echo "Successfully found and copied kernel Image from: $IMAGE_SRC ($(du -h "$IMAGE_SRC" | cut -f1))"
           else
-            echo "未找到 Image 文件，构建可能失败"
+            echo "ERROR: Kernel Image binary not found in any out/ tree! Failing the job instead of shipping an empty zip."
             exit 1
           fi
+
+          # Export the discovered dist directory for later steps (KPM patch_linux, audit)
+          DIST_DIR="$(dirname "$IMAGE_SRC")"
+          echo "IMAGE_SRC=$IMAGE_SRC" >> $GITHUB_ENV
+          echo "DIST_DIR=$DIST_DIR" >> $GITHUB_ENV
 
           # 可选复制其它新文件（如果存在）
           if [ "${{ github.event.inputs.CPU }}" = "sm8750" ] || [ "${{ github.event.inputs.CPU }}" = "sm8850" ]; then
           for file in dtbo.img system_dlkm.erofs.img vendor_dlkm.img vendor_boot.img; do
-            if [ -f "$dir1$file" ]; then
+            if [ -f "$DIST_DIR/$file" ]; then
               target_name="$file"
               # 特殊处理 system_dlkm.erofs.img 的目标名
               if [ "$file" = "system_dlkm.erofs.img" ]; then
                 target_name="system_dlkm.img"
               fi
-              cp "$dir1$file" "./AnyKernel3/$target_name"
+              cp "$DIST_DIR/$file" "./AnyKernel3/$target_name"
             else
               echo "$file 不存在，跳过复制"
             fi
@@ -387,14 +509,25 @@ jobs:
       - name: Apply patch_linux and replace Image
         if: ${{ github.event.inputs.KPM == 'true' }}
         run: |
-          cd /home/runner/work/Action_OnePlus_MKSU_SUSFS/Action_OnePlus_MKSU_SUSFS/kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist
+          # Use the dist directory discovered dynamically in "Make AnyKernel3"
+          # (no hardcoded kalama/crow path, no hardcoded runner workspace path).
+          if [ -z "$DIST_DIR" ] || [ ! -f "$DIST_DIR/Image" ]; then
+            echo "ERROR: DIST_DIR not set or Image missing (DIST_DIR='$DIST_DIR')"
+            exit 1
+          fi
+          cd "$DIST_DIR"
 
           curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
           chmod +x patch_linux
           ./patch_linux
+          if [ ! -s oImage ]; then
+            echo "ERROR: patch_linux did not produce oImage"
+            exit 1
+          fi
           rm -f Image
           mv oImage Image
           cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
+          echo "KPM-patched Image installed ($(du -h Image | cut -f1))"
 
       # 下载 SUSFS 模块（CI）
       - name: Download Latest SUSFS Module from CI
@@ -419,8 +552,30 @@ jobs:
       - name: Download Latest SUSFS Module from Release
         if: ${{ github.event.inputs.SUSFS_CI == 'false' }}
         run: |
-          wget https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
-          cp ksu_module_susfs_1.5.2+.zip ./AnyKernel3/
+          # STEP 6: unify naming — both CI and Release paths deliver ./AnyKernel3/ksu_module_susfs.zip
+          wget -O ksu_module_susfs.zip https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
+          cp ksu_module_susfs.zip ./AnyKernel3/
+
+      # STEP 7: post-build verification of the config the build actually consumed
+      - name: Verify applied kernel config
+        run: |
+          OUT_CONFIG=$(find kernel_workspace/kernel_platform/out -name ".config" -path "*msm-kernel*" 2>/dev/null | head -n 1)
+          if [ -z "$OUT_CONFIG" ]; then
+            OUT_CONFIG=$(find kernel_workspace/kernel_platform/out -name ".config" 2>/dev/null | head -n 1)
+          fi
+          if [ -n "$OUT_CONFIG" ]; then
+            echo "Auditing: $OUT_CONFIG"
+            echo "=== Applied config audit ==="
+            grep -E "CONFIG_TCP_CONG_BBR|CONFIG_DEFAULT_BBR|CONFIG_DEFAULT_TCP_CONG|CONFIG_NET_SCH_FQ|CONFIG_DEFAULT_NET_SCH|CONFIG_ZRAM_DEF_COMP|CONFIG_UCLAMP_TASK|CONFIG_MQ_IOSCHED_KYBER|CONFIG_LTO_CLANG|CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND|CONFIG_SLUB_DEBUG" "$OUT_CONFIG" || true
+            echo "=== KSU / SUSFS state ==="
+            grep -E "^CONFIG_KSU" "$OUT_CONFIG" || echo "WARNING: no CONFIG_KSU symbols in .config"
+            echo "=== KPM state ==="
+            grep -E "CONFIG_KPM" "$OUT_CONFIG" || echo "KPM not enabled (input off or symbol absent)"
+          else
+            echo "No .config found under kernel_platform/out — skipping audit"
+          fi
+          echo "=== AnyKernel3 payload ==="
+          ls -la ./AnyKernel3/
 
       - name: Set suffix
         id: suffix
