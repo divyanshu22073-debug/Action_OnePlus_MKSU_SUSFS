@@ -198,10 +198,79 @@ jobs:
           cd kernel_workspace/kernel_platform
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
           cd ./KernelSU
-          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
+          # Align KSUVER with the SukiSU Makefile's own version formula when present
+          # (v4.x layout: VERSION_BASE + <commits on main> - VERSION_OFFSET, e.g.
+          #  40000 + N - 2815; legacy layout fallback: N + 10606). Without this the
+          # artifact name (KSUVER) and the in-kernel version banner disagree.
+          KSU_COUNT=$(/usr/bin/git rev-list --count main 2>/dev/null || echo 0)
+          VB=$(sed -n 's/^VERSION_BASE[[:space:]]*:=[[:space:]]*\([0-9]*\).*/\1/p' kernel/Makefile | head -n1)
+          VO=$(sed -n 's/^VERSION_OFFSET[[:space:]]*:=[[:space:]]*\([0-9]*\).*/\1/p' kernel/Makefile | head -n1)
+          if [ -n "$VB" ] && [ -n "$VO" ] && [ "$KSU_COUNT" -gt 0 ]; then
+            KSU_VERSION=$((VB + KSU_COUNT - VO))
+          else
+            KSU_VERSION=$((KSU_COUNT + 10606))
+          fi
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+
+          # --- FIX: restore ksu_handle_post_execveat_sucompat for the susfs4ksu kernel patch ---
+          # susfs4ksu's 50_add_susfs_in_gki-*.patch makes do_execveat_common() in fs/exec.c
+          # call ksu_handle_post_execveat_sucompat() under CONFIG_KSU_SUSFS (introduced as a
+          # direct ksu_install_su_fd() call in commit b70ff734 on 2026-09-06, refactored into
+          # the hook in 53869d88 on 2026-09-12). Vanilla KernelSU receives that symbol from
+          # susfs4ksu's companion patch KernelSU/10_enable_susfs_for_ksu.patch, where it
+          # installs the su-session fd after a successful su exec. SukiSU-Ultra's 'builtin'
+          # branch has native SUSFS support but no su-fd mechanism (the root profile is
+          # applied pre-exec via escape_with_root_profile()), so it never defined the hook:
+          #   ld.lld: error: undefined symbol: ksu_handle_post_execveat_sucompat
+          #   >>> referenced by exec.c:2006 (source/fs/exec.c:2006)
+          # Correct fix for SukiSU: an intentional no-op shim. It must stay cheap because
+          # SukiSU's ksu_handle_execveat_sucompat() always returns 0, so the patched exec.c
+          # flags EVERY execveat as an su session and calls the post hook on every success.
+          # The shim is appended to the sucompat translation unit, which works with both the
+          # v4.x unity build (ksu.c #includes feature/sucompat.c) and the legacy multi-object
+          # layout (sucompat.o). Idempotent, and self-disables if SukiSU ever ships the hook.
+          SHIM_HOST=""
+          for cand in kernel/feature/sucompat.c kernel/sucompat.c; do
+            if [ -f "$cand" ]; then SHIM_HOST="$cand"; break; fi
+          done
+          if [ -z "$SHIM_HOST" ]; then
+            echo "::error::No sucompat.c found in the SukiSU tree - cannot install the post_execveat shim. Upstream layout changed; update the workflow."
+            exit 1
+          fi
+          if grep -rq "ksu_handle_post_execveat_sucompat" kernel/; then
+            echo "ksu_handle_post_execveat_sucompat already provided natively - shim skipped"
+          else
+            cat >> "$SHIM_HOST" <<'SHIM_EOF'
+
+          /* --- CI shim: susfs4ksu kernel-patch compatibility (added by workflow) ---
+           * Referenced from do_execveat_common() in fs/exec.c (50_add_susfs_in_gki-*.patch)
+           * under CONFIG_KSU_SUSFS. Vanilla KernelSU installs the su-session fd here after
+           * a successful su exec; SukiSU-Ultra finalizes su sessions inside
+           * ksu_handle_execveat_sucompat() (escape_with_root_profile) and has no su-fd
+           * mechanism, so this hook is intentionally a no-op. Keep it cheap: with SukiSU
+           * it runs on every successful execveat.
+           */
+          #ifdef CONFIG_KSU_SUSFS
+          int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,
+                          void *argv_user, void *envp_user,
+                          int *__never_use_flags, int *retval)
+          {
+              (void)fd;
+              (void)filename_ptr;
+              (void)argv_user;
+              (void)envp_user;
+              (void)__never_use_flags;
+              (void)retval;
+              return 0;
+          }
+          #endif
+          SHIM_EOF
+            echo "post_execveat shim appended to $SHIM_HOST"
+          fi
+          echo "=== shim verification ==="
+          grep -n "ksu_handle_post_execveat_sucompat" "$SHIM_HOST" || { echo "::error::shim installation failed"; exit 1; }
 
       - name: Apply Patches SukiSU Ultra
         run: |
