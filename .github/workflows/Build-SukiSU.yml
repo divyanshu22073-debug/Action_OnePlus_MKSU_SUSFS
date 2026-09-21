@@ -477,24 +477,24 @@ jobs:
           CONFIG_FILE=./common/arch/arm64/configs/gki_defconfig
 
             if [ "${{ github.event.inputs.KERNEL_VERSION }}" = "5.10" ]; then
-              echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
-              echo "CONFIG_ZRAM=y" >> "$CONFIG_FILE"
-              echo "CONFIG_MODULE_SIG=n" >> "$CONFIG_FILE"
-              echo "CONFIG_CRYPTO_LZO=y" >> "$CONFIG_FILE"
-              echo "CONFIG_ZRAM_DEF_COMP_LZ4KD=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_ZSMALLOC=" "$CONFIG_FILE" || echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_ZRAM=" "$CONFIG_FILE" || echo "CONFIG_ZRAM=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_MODULE_SIG=" "$CONFIG_FILE" || echo "CONFIG_MODULE_SIG=n" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_CRYPTO_LZO=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZO=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_ZRAM_DEF_COMP_LZ4KD=" "$CONFIG_FILE" || echo "CONFIG_ZRAM_DEF_COMP_LZ4KD=y" >> "$CONFIG_FILE"
             fi
 
             if [ "${{ github.event.inputs.KERNEL_VERSION }}" != "6.6" ] && [ "${{ github.event.inputs.KERNEL_VERSION }}" != "6.12" ] && [ "${{ github.event.inputs.KERNEL_VERSION }}" != "5.10" ]; then
               if grep -q "CONFIG_ZSMALLOC" -- "$CONFIG_FILE"; then
                 sed -i 's/CONFIG_ZSMALLOC=m/CONFIG_ZSMALLOC=y/g' "$CONFIG_FILE"
               else
-                echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
+                grep -q "^CONFIG_ZSMALLOC=" "$CONFIG_FILE" || echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
               fi
               sed -i 's/CONFIG_ZRAM=m/CONFIG_ZRAM=y/g' "$CONFIG_FILE"
             fi
 
             if [ "${{ github.event.inputs.KERNEL_VERSION }}" = "6.6" ] || [ "${{ github.event.inputs.KERNEL_VERSION }}" = "6.12" ]; then
-              echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_ZSMALLOC=" "$CONFIG_FILE" || echo "CONFIG_ZSMALLOC=y" >> "$CONFIG_FILE"
               sed -i 's/CONFIG_ZRAM=m/CONFIG_ZRAM=y/g' "$CONFIG_FILE"
             fi
 
@@ -509,18 +509,18 @@ jobs:
                 echo "CONFIG_ZRAM=y" >> "msm-kernel/arch/arm64/configs/${{ github.event.inputs.CPUD }}-GKI.config"
               fi
               
-              echo "CONFIG_MODULE_SIG_FORCE=n" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_MODULE_SIG_FORCE=" "$CONFIG_FILE" || echo "CONFIG_MODULE_SIG_FORCE=n" >> "$CONFIG_FILE"
             elif [ "${{ github.event.inputs.KERNEL_VERSION }}" = "5.10" ] || [ "${{ github.event.inputs.KERNEL_VERSION }}" = "5.15" ]; then
               rm "common/android/gki_aarch64_modules"
               touch "common/android/gki_aarch64_modules"
             fi
 
             if grep -q "CONFIG_ZSMALLOC=y" "$CONFIG_FILE" && grep -q "CONFIG_ZRAM=y" "$CONFIG_FILE"; then
-              echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
-              echo "CONFIG_CRYPTO_LZ4K=y" >> "$CONFIG_FILE"
-              echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG_FILE"
-              echo "CONFIG_CRYPTO_842=y" >> "$CONFIG_FILE"
-              echo "CONFIG_ZRAM_WRITEBACK=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_CRYPTO_LZ4HC=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZ4HC=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_CRYPTO_LZ4K=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZ4K=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_CRYPTO_LZ4KD=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_LZ4KD=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_CRYPTO_842=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_842=y" >> "$CONFIG_FILE"
+              grep -q "^CONFIG_ZRAM_WRITEBACK=" "$CONFIG_FILE" || echo "CONFIG_ZRAM_WRITEBACK=y" >> "$CONFIG_FILE"
             fi
           fi
 
@@ -610,6 +610,32 @@ jobs:
           if [ -d ./common/drivers/misc/ntsync ] || [ -d ./common/fs/ntsync ]; then
             grep -q "^CONFIG_NTSYNC=" "$CONFIG_FILE" || echo "CONFIG_NTSYNC=y" >> "$CONFIG_FILE"
           fi
+
+          # --- 4h. Memory / scheduler / storage (verified 5.15 symbols, all guarded) --------
+          # MGLRU on by default (tree has LRU_GEN=y but not the _ENABLED default, so
+          # it is compiled in yet dormant until userspace flips /sys/kernel/mm/lru_gen):
+          grep -q "^CONFIG_LRU_GEN_ENABLED="   "$CONFIG_FILE" || echo "CONFIG_LRU_GEN_ENABLED=y"   >> "$CONFIG_FILE"
+          # mq-deadline as a selectable alternative (kyber/bfq already present):
+          grep -q "^CONFIG_MQ_IOSCHED_DEADLINE=" "$CONFIG_FILE" || echo "CONFIG_MQ_IOSCHED_DEADLINE=y" >> "$CONFIG_FILE"
+          # F2FS transparent compression back-ends (compression=y is already set but
+          # only the LZO/LZ4 algorithms the ROM picks at mkfs can be used; provide all):
+          grep -q "^CONFIG_F2FS_FS_LZ4="        "$CONFIG_FILE" || echo "CONFIG_F2FS_FS_LZ4=y"        >> "$CONFIG_FILE"
+          grep -q "^CONFIG_F2FS_FS_LZ4HC="      "$CONFIG_FILE" || echo "CONFIG_F2FS_FS_LZ4HC=y"      >> "$CONFIG_FILE"
+          grep -q "^CONFIG_F2FS_FS_ZSTD="       "$CONFIG_FILE" || echo "CONFIG_F2FS_FS_ZSTD=y"       >> "$CONFIG_FILE"
+          grep -q "^CONFIG_F2FS_IOSTAT="        "$CONFIG_FILE" || echo "CONFIG_F2FS_IOSTAT=y"        >> "$CONFIG_FILE"
+          # Faster crypto primitives used by fscrypt/dm-verity/WireGuard (ARM64 CE/NEON):
+          grep -q "^CONFIG_CRYPTO_CHACHA20_NEON=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_CHACHA20_NEON=y" >> "$CONFIG_FILE"
+          grep -q "^CONFIG_CRYPTO_POLY1305_NEON=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_POLY1305_NEON=y" >> "$CONFIG_FILE"
+          grep -q "^CONFIG_CRYPTO_CRCT10DIF_ARM64_CE=" "$CONFIG_FILE" || echo "CONFIG_CRYPTO_CRCT10DIF_ARM64_CE=y" >> "$CONFIG_FILE"
+          # LSE atomics on Cortex-A7xx (faster locks/refcounts; ARM64_USE_LSE_ATOMICS):
+          grep -q "^CONFIG_ARM64_USE_LSE_ATOMICS=" "$CONFIG_FILE" || echo "CONFIG_ARM64_USE_LSE_ATOMICS=y" >> "$CONFIG_FILE"
+          # NOTE (deliberately NOT changed - each would break the GKI KMI or the vendor
+          # modules this Image must load): HZ (250 stays), PREEMPT model, SCHED_AUTOGROUP
+          # (changes signal_struct layout), CC_OPTIMIZE_* (O2 stays), KASAN/UBSAN/KFENCE
+          # (part of the vendor .config contract), any CPU_FREQ_GOV_* (the SoC uses the
+          # WALT governor which is a vendor module: CONFIG_SCHED_WALT=m), MSM_KGSL /
+          # Adreno-TZ (vendor module). Those are tuned at runtime by the bundled
+          # perf-tuner KSU module instead (see 'Build runtime tuner module' step).
 
           # =====================================================================
           # STEP 4g: Network *parameter* tuning (source-level sysctl defaults)
@@ -705,6 +731,26 @@ jobs:
         run: |
           git clone https://github.com/Numbersf/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
+
+          # Teach the flasher about the bundled runtime perf-tuner module (installed
+          # via ksud after the kernel is written; skipped silently if ksud is absent
+          # or the zip is missing). Appended, so upstream anykernel.sh changes still apply.
+          if ! grep -q "oneplus_perf_tuner.zip" ./AnyKernel3/anykernel.sh; then
+            cat >> ./AnyKernel3/anykernel.sh <<'EOF'
+
+          # =============
+          # Perf tuner module (CI-bundled)
+          # =============
+          if [ -f "$AKHOME/oneplus_perf_tuner.zip" ]; then
+            if [ -f /data/adb/ksud ]; then
+              ui_print " Installing OnePlus Perf Tuner module (network/GPU/sched/IO tuning)..."
+              /data/adb/ksud module install "$AKHOME/oneplus_perf_tuner.zip" && ui_print " Perf Tuner installed." || ui_print " Perf Tuner install failed (non-fatal)."
+            else
+              ui_print " KSUD not found - skipping Perf Tuner module."
+            fi
+          fi
+          EOF
+          fi
 
           # STEP 5: dynamic Image discovery. Never hardcode an out-dir path: the
           # oplus build script silently remaps unknown CPUD values (e.g. crow ->
@@ -818,6 +864,211 @@ jobs:
           cp "$OUT" ./AnyKernel3/"$OUT"
           cp "$OUT" ./AnyKernel3/"$FLASHER_NAME"
           echo "SUSFS module shipped as: $OUT and $FLASHER_NAME ($(du -h "$OUT" | cut -f1))"
+
+      # Runtime tuner: the parts of "network / GPU / scheduler tuning" that live in
+      # vendor modules (WALT cpufreq, KGSL devfreq, thermal) or are sysctl-only cannot
+      # be baked into a GKI Image without breaking the KMI. Ship them as a KernelSU
+      # module that applies at boot. Every write is guarded by "node exists", so it is
+      # safe on any ROM/firmware; values are the conservative-fast set for SM7550.
+      - name: Build runtime tuner module
+        run: |
+          set -o pipefail
+          M=perf_tuner_module
+          rm -rf "$M" && mkdir -p "$M/META-INF/com/google/android"
+          cat > "$M/module.prop" <<'EOF'
+          id=oneplus_perf_tuner
+          name=OnePlus Nord CE4 Perf Tuner (Kernel companion)
+          version=v1.0
+          versionCode=1
+          author=Action_OnePlus_MKSU_SUSFS CI
+          description=Boot-time network/GPU/scheduler/IO tuning matching the BBR+FQ SukiSU kernel. Safe: every knob is guarded.
+          EOF
+          # KernelSU/Magisk module installer stubs
+          printf '#MAGISK\n' > "$M/META-INF/com/google/android/updater-script"
+          cat > "$M/META-INF/com/google/android/update-binary" <<'EOF'
+          #!/sbin/sh
+          umask 022
+          ui_print() { echo "$1"; }
+          require_new_magisk() { ui_print "*******************************"; ui_print " Please install Magisk/KernelSU "; ui_print "*******************************"; exit 1; }
+          OUTFD=$2
+          ZIPFILE=$3
+          mount /data 2>/dev/null
+          [ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk
+          . /data/adb/magisk/util_functions.sh
+          install_module
+          exit 0
+          EOF
+          cat > "$M/service.sh" <<'EOF'
+          #!/system/bin/sh
+          # Runs in late_start service mode. Waits for boot to finish so vendor
+          # init/perfd have already written their defaults; ours win.
+          MODDIR=${0%/*}
+          LOG=/data/adb/perf_tuner.log
+          w() { [ -e "$1" ] && [ -w "$1" ] && echo "$2" > "$1" 2>/dev/null && echo "OK  $1 = $2" >> "$LOG" || echo "SKIP $1" >> "$LOG"; }
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 2; done
+          sleep 15
+          : > "$LOG"; echo "perf_tuner start $(date)" >> "$LOG"
+
+          ## ---- Network (kernel already defaults BBR/fq/ECN; these are the rest) ----
+          w /proc/sys/net/ipv4/tcp_congestion_control bbr
+          w /proc/sys/net/core/default_qdisc fq
+          w /proc/sys/net/ipv4/tcp_ecn 1
+          w /proc/sys/net/ipv4/tcp_fastopen 3
+          w /proc/sys/net/ipv4/tcp_slow_start_after_idle 0
+          w /proc/sys/net/ipv4/tcp_mtu_probing 1
+          w /proc/sys/net/ipv4/tcp_rfc1337 1
+          w /proc/sys/net/ipv4/tcp_notsent_lowat 131072
+          w /proc/sys/net/ipv4/tcp_no_metrics_save 1
+          w /proc/sys/net/ipv4/tcp_timestamps 1
+          w /proc/sys/net/ipv4/tcp_sack 1
+          w /proc/sys/net/ipv4/tcp_window_scaling 1
+          w /proc/sys/net/ipv4/tcp_low_latency 1
+          w /proc/sys/net/ipv4/tcp_keepalive_time 300
+          w /proc/sys/net/ipv4/tcp_keepalive_intvl 30
+          w /proc/sys/net/ipv4/tcp_keepalive_probes 5
+          w /proc/sys/net/ipv4/tcp_fin_timeout 30
+          w /proc/sys/net/ipv4/tcp_tw_reuse 1
+          w /proc/sys/net/ipv4/tcp_syncookies 1
+          w /proc/sys/net/ipv4/tcp_rmem "4096 1048576 16777216"
+          w /proc/sys/net/ipv4/tcp_wmem "4096 262144 16777216"
+          w /proc/sys/net/ipv4/udp_rmem_min 16384
+          w /proc/sys/net/ipv4/udp_wmem_min 16384
+          w /proc/sys/net/core/rmem_max 16777216
+          w /proc/sys/net/core/wmem_max 16777216
+          w /proc/sys/net/core/rmem_default 262144
+          w /proc/sys/net/core/wmem_default 262144
+          w /proc/sys/net/core/netdev_max_backlog 2500
+          w /proc/sys/net/core/netdev_budget 600
+          w /proc/sys/net/core/somaxconn 1024
+          w /proc/sys/net/ipv4/ip_local_port_range "16384 65535"
+          w /proc/sys/net/ipv6/conf/all/use_tempaddr 2
+          w /proc/sys/net/ipv6/conf/default/use_tempaddr 2
+
+          ## ---- GPU: Adreno 720 (KGSL, vendor module) ----
+          G=/sys/class/kgsl/kgsl-3d0
+          if [ -d "$G" ]; then
+            w $G/devfreq/governor msm-adreno-tz
+            w $G/throttling 0
+            w $G/force_no_nap 0
+            w $G/bus_split 1
+            w $G/force_bus_on 0
+            w $G/force_rail_on 0
+            w $G/force_clk_on 0
+            w $G/idle_timer 80
+            # Let the GPU reach its top bin under load; min stays at the lowest bin.
+            MAX=$(cat $G/max_gpuclk 2>/dev/null); [ -n "$MAX" ] && w $G/devfreq/max_freq "$MAX"
+            w $G/max_pwrlevel 0
+            w $G/default_pwrlevel $(cat $G/num_pwrlevels 2>/dev/null | awk '{print $1-1}')
+          fi
+
+          ## ---- CPU: WALT/schedutil (vendor governor); keep boost responsive ----
+          for P in /sys/devices/system/cpu/cpufreq/policy*; do
+            [ -d "$P" ] || continue
+            GOV=$(cat $P/scaling_governor 2>/dev/null)
+            case "$GOV" in
+              walt)
+                w $P/walt/hispeed_load 85
+                w $P/walt/pl 1
+                w $P/walt/rtg_boost_freq 0
+                w $P/walt/adaptive_low_freq 0 ;;
+              schedutil)
+                w $P/schedutil/rate_limit_us 500
+                w $P/schedutil/up_rate_limit_us 500
+                w $P/schedutil/down_rate_limit_us 5000 ;;
+            esac
+          done
+          # WALT scheduler tunables (sm7550: prime/gold/silver clusters)
+          W=/proc/sys/walt
+          if [ -d "$W" ]; then
+            w $W/sched_boost 0
+            w $W/sched_group_upmigrate 95
+            w $W/sched_group_downmigrate 85
+            w $W/sched_min_task_util_for_boost 51
+            w $W/sched_min_task_util_for_colocation 35
+            w $W/sched_many_wakeup_threshold 1000
+            w $W/sched_conservative_pl 0
+          fi
+          # Generic CFS/uclamp knobs present in GKI 5.15
+          w /proc/sys/kernel/sched_util_clamp_min_rt_default 0
+          w /proc/sys/kernel/sched_util_clamp_min 1024
+          w /proc/sys/kernel/sched_util_clamp_max 1024
+          w /proc/sys/kernel/sched_autogroup_enabled 0
+          w /proc/sys/kernel/perf_cpu_time_max_percent 5
+          w /proc/sys/kernel/sched_schedstats 0
+          w /proc/sys/kernel/printk "3 3 1 3"
+          w /sys/kernel/debug/sched/latency_ns 4000000 2>/dev/null
+          w /sys/kernel/debug/sched/min_granularity_ns 500000 2>/dev/null
+          w /sys/kernel/debug/sched/wakeup_granularity_ns 1000000 2>/dev/null
+          w /sys/kernel/debug/sched/migration_cost_ns 500000 2>/dev/null
+
+          ## ---- Memory: MGLRU + zram + reclaim ----
+          w /sys/kernel/mm/lru_gen/enabled 0x0007
+          w /sys/kernel/mm/lru_gen/min_ttl_ms 1000
+          w /proc/sys/vm/swappiness 100
+          w /proc/sys/vm/vfs_cache_pressure 50
+          w /proc/sys/vm/dirty_ratio 30
+          w /proc/sys/vm/dirty_background_ratio 10
+          w /proc/sys/vm/dirty_expire_centisecs 3000
+          w /proc/sys/vm/dirty_writeback_centisecs 1500
+          w /proc/sys/vm/page-cluster 0
+          w /proc/sys/vm/extra_free_kbytes 32768
+          w /proc/sys/vm/watermark_scale_factor 125
+          w /proc/sys/vm/stat_interval 10
+          w /proc/sys/vm/compaction_proactiveness 0
+          w /sys/kernel/mm/transparent_hugepage/enabled madvise
+          w /sys/kernel/mm/transparent_hugepage/defrag never
+          w /sys/kernel/mm/transparent_hugepage/khugepaged/defrag 0
+          w /sys/module/zram/parameters/compressor lz4kd 2>/dev/null
+
+          ## ---- Storage: UFS 3.1 (sda..sdf + dm) ----
+          for B in /sys/block/sd* /sys/block/dm-*; do
+            [ -d "$B/queue" ] || continue
+            case "$B" in
+              */sd*)
+                if grep -qw kyber $B/queue/scheduler 2>/dev/null; then w $B/queue/scheduler kyber
+                elif grep -qw mq-deadline $B/queue/scheduler 2>/dev/null; then w $B/queue/scheduler mq-deadline; fi
+                w $B/queue/read_ahead_kb 256
+                w $B/queue/nr_requests 128
+                w $B/queue/iostats 0
+                w $B/queue/add_random 0
+                w $B/queue/rq_affinity 2
+                w $B/queue/nomerges 0
+                w $B/queue/wbt_lat_usec 2000 ;;
+              */dm-*)
+                w $B/queue/read_ahead_kb 128
+                w $B/queue/iostats 0
+                w $B/queue/add_random 0 ;;
+            esac
+          done
+          w /proc/sys/fs/file-max 524288
+          w /proc/sys/fs/inotify/max_user_watches 524288
+
+          ## ---- Wi-Fi / IRQ locality ----
+          w /proc/irq/default_smp_affinity f0
+          echo "perf_tuner done $(date)" >> "$LOG"
+          EOF
+          cat > "$M/post-fs-data.sh" <<'EOF'
+          #!/system/bin/sh
+          # Early phase: nothing to do; keep file so KSU treats module as scripted.
+          exit 0
+          EOF
+          cat > "$M/uninstall.sh" <<'EOF'
+          #!/system/bin/sh
+          rm -f /data/adb/perf_tuner.log
+          EOF
+          cat > "$M/customize.sh" <<'EOF'
+          #!/system/bin/sh
+          ui_print "- OnePlus Nord CE4 Perf Tuner"
+          ui_print "- Applies BBR/fq/ECN network, Adreno-720 KGSL, WALT/uclamp, MGLRU, UFS I/O tuning at boot"
+          ui_print "- Log: /data/adb/perf_tuner.log"
+          set_perm_recursive $MODPATH 0 0 0755 0755
+          EOF
+          chmod 0755 "$M"/*.sh "$M/META-INF/com/google/android/update-binary"
+          (cd "$M" && zip -qr9 ../oneplus_perf_tuner.zip .)
+          unzip -tq oneplus_perf_tuner.zip >/dev/null && unzip -p oneplus_perf_tuner.zip module.prop >/dev/null
+          cp oneplus_perf_tuner.zip ./AnyKernel3/
+          echo "runtime tuner module: $(du -h oneplus_perf_tuner.zip | cut -f1)"
+          sh -n "$M/service.sh" && echo "service.sh syntax OK"
 
       # STEP 7: post-build verification of the config the build actually consumed
       - name: Verify applied kernel config
